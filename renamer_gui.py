@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, re, json, sys
+import os, re, json, sys, threading, queue
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
@@ -16,7 +16,7 @@ try:
 except Exception:
     pytesseract = None
 
-APP_TITLE = "Переименование отсканированных файлов — Ella Renamer v3.1 (зоны+якоря, верхняя панель)"
+APP_TITLE = "Переименование отсканированных файлов — Ella Renamer v3.2 (фоновые задачи)"
 SUPPORTED_EXTS = (".jpg",".jpeg",".png",".webp",".tif",".tiff",".bmp",".jfif")
 PATTERN = re.compile(r"(2711\d{4}|20\d{6})")
 CONFIG_NAME = "config.json"
@@ -170,11 +170,19 @@ def find_near_anchor(region_img)->Tuple[Optional[str], Optional[Tuple[int,int,in
 def extract_number_debug(path: Path, cfg: dict):
     if Image is None:
         return {"serial": None, "angle":0, "bbox": None, "source": None, "img": None}
-    try: base = pil_open(path)
+    try:
+        base = pil_open(path)
     except Exception:
         return {"serial": None, "angle":0, "bbox": None, "source": None, "img": None}
 
+    # Ускорение: ограничим максимальную ширину изображения (OCR хватает)
+    max_w = 2400
+    if base.size[0] > max_w:
+        h = int(base.size[1] * (max_w / base.size[0]))
+        base = base.resize((max_w, h))
+
     for angle, img in orientations(base, cfg.get("use_rotations", True)):
+        # 1) По якорям
         for bbox_reg, lbl in search_regions(img):
             region = img.crop(bbox_reg)
             serial, box, why = find_near_anchor(region)
@@ -186,6 +194,7 @@ def extract_number_debug(path: Path, cfg: dict):
                 else:
                     gb = bbox_reg
                 return {"serial": serial, "angle": angle, "bbox": gb, "source": f"{lbl}, {why}", "img": img}
+        # 2) Фолбэк: только в зонах
         for bbox_reg, lbl in search_regions(img):
             region = img.crop(bbox_reg)
             for item in ocr_data_digits(preprocess(region)):
@@ -209,14 +218,24 @@ def propose(date_str:str, serial:str, ext:str, existing:set, seen:dict)->str:
 class App(ttk.Frame):
     def __init__(self, master):
         super().__init__(master); self.pack(fill="both", expand=True)
-        master.title(APP_TITLE); master.geometry("1180x640")
+        master.title(APP_TITLE); master.geometry("1180x660")
         self.cfg = load_config(); ensure_tess(self.cfg)
         self.dir_var=tk.StringVar(); self.date_var=tk.StringVar()
         self.tess_var=tk.StringVar(value=self.cfg.get("tesseract_path",""))
-        self.status=tk.StringVar(value="Готово"); self.rows=[]; self.preview_cache={}
+        self.status=tk.StringVar(value="Готово")
+
+        # worker
+        self.worker=None
+        self.cancel_flag=False
+        self.q = queue.Queue()
+        self.total = 0
+        self.done = 0
+
+        self.rows=[]; self.preview_cache={}
         self._photo=None
         self.build()
-        master.bind("<F5>", lambda e: self.preview())
+
+        master.bind("<F5>", lambda e: self.start_preview())
         master.bind("<F6>", lambda e: self.apply())
         master.bind("<Control-o>", lambda e: self.choose_dir())
 
@@ -233,17 +252,29 @@ class App(ttk.Frame):
         ttk.Button(top,text="Найти...",command=self.choose_tess).grid(row=2,column=2,padx=4)
         ttk.Button(top,text="Сохранить",command=self.save_cfg).grid(row=2,column=3,padx=4)
 
-        toolbar=ttk.Frame(top); toolbar.grid(row=3, column=0, columnspan=4, sticky="we", pady=(8,0))
-        ttk.Button(toolbar,text="Предпросмотр (F5)",command=self.preview).pack(side="left",padx=4)
-        ttk.Button(toolbar,text="Переименовать (F6)",command=self.apply).pack(side="left",padx=4)
+        # панель действий
+        toolbar=ttk.Frame(top); toolbar.grid(row=3,column=0,columnspan=4,sticky="we",pady=(8,4))
+        self.btn_preview = ttk.Button(toolbar,text="Предпросмотр (F5)",command=self.start_preview)
+        self.btn_preview.pack(side="left",padx=4)
+        self.btn_cancel = ttk.Button(toolbar,text="Отмена",command=self.cancel_preview,state="disabled")
+        self.btn_cancel.pack(side="left",padx=4)
+        self.btn_rename = ttk.Button(toolbar,text="Переименовать (F6)",command=self.apply)
+        self.btn_rename.pack(side="left",padx=4)
         ttk.Button(toolbar,text="Открыть папку",command=self.open_folder).pack(side="left",padx=4)
 
-        manual=ttk.Frame(top); manual.grid(row=4, column=0, columnspan=4, sticky="we", pady=(6,0))
+        # прогресс
+        prog=ttk.Frame(top); prog.grid(row=4,column=0,columnspan=4,sticky="we")
+        self.pb = ttk.Progressbar(prog,mode="determinate",maximum=100)
+        self.pb.pack(fill="x",expand=True)
+
+        # ручной ввод
+        manual=ttk.Frame(top); manual.grid(row=5,column=0,columnspan=4,sticky="we",pady=(6,0))
         ttk.Label(manual, text="Ручной ввод номера (для выбранного файла):").pack(side="left")
         self.manual_var = tk.StringVar()
         ttk.Entry(manual, textvariable=self.manual_var, width=20).pack(side="left", padx=6)
         ttk.Button(manual, text="Применить к выбранному", command=self.apply_manual).pack(side="left")
 
+        # основная область
         main=ttk.Frame(self); main.pack(fill="both", expand=True, padx=10, pady=6)
         left=ttk.Frame(main); left.pack(side="left", fill="both", expand=True)
         self.tree=ttk.Treeview(left,columns=("old","serial","new","status"),show="headings",height=18)
@@ -262,6 +293,7 @@ class App(ttk.Frame):
 
         top.columnconfigure(1, weight=1)
 
+    # ---------- UI actions ----------
     def choose_dir(self):
         p=filedialog.askdirectory(title="Выберите папку с файлами")
         if p: self.dir_var.set(p); self.fill_date()
@@ -286,29 +318,86 @@ class App(ttk.Frame):
         if not f.exists(): return []
         return [f/n for n in sorted(os.listdir(f)) if n.lower().endswith(SUPPORTED_EXTS)]
 
-    def preview(self):
+    # ---------- threaded preview ----------
+    def start_preview(self):
+        if self.worker and self.worker.is_alive():
+            return
         self.tree.delete(*self.tree.get_children()); self.preview_cache.clear()
-        self.canvas.delete("all"); self._photo=None
-        self.status.set("Распознавание (правый верх и левая вертикаль; якоря «отправка №», «№»)..."); self.update_idletasks()
+        self.pb["value"]=0; self.status.set("Подготовка...")
         fs=self.files()
-        if not fs: self.status.set("Файлы не найдены."); return
+        if not fs:
+            self.status.set("Файлы не найдены."); return
         date=self.date_var.get().strip()
         if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", date):
             messagebox.showwarning("Дата","Введите ДД.ММ.ГГГГ или нажмите «Из имени папки»."); self.status.set("Ожидает даты."); return
-        folder=Path(self.dir_var.get().strip()); existing=set(os.listdir(folder)); seen={}; self.rows=[]
 
-        for p in fs:
-            dbg = extract_number_debug(p, {"use_rotations": True}) if Image else {"serial": None, "img": None, "bbox": None, "angle": 0, "source": None}
-            self.preview_cache[p.name] = dbg
-            serial = dbg["serial"]
-            if not serial: st="НЕ НАЙДЕНО"; newname=""
-            else: st="OK"; newname=propose(date,serial,p.suffix.lower(),existing,seen)
-            row={"old":p.name,"serial":serial or "","new":newname,"status":st}
-            self.rows.append(row); self.tree.insert("", "end", values=(row["old"],row["serial"],row["new"],row["status"]))
-        self.status.set("Готово. Выберите строку — справа подсветится зона (если найдена).")
+        ensure_tess(load_config())
+        self.rows=[]; self.cancel_flag=False; self.total=len(fs); self.done=0
+        self.btn_preview.config(state="disabled"); self.btn_cancel.config(state="normal"); self.btn_rename.config(state="disabled")
+        # пустим воркер
+        self.q = queue.Queue()
+        self.worker = threading.Thread(target=self._worker_preview, args=(fs, date), daemon=True)
+        self.worker.start()
+        self.after(100, self._poll_queue)
 
+    def cancel_preview(self):
+        self.cancel_flag=True
+        self.status.set("Отмена...")
+
+    def _worker_preview(self, files: List[Path], date: str):
+        folder = Path(self.dir_var.get().strip())
+        existing=set(os.listdir(folder)); seen={}
+        for p in files:
+            if self.cancel_flag: break
+            try:
+                dbg = extract_number_debug(p, {"use_rotations": True}) if Image else {"serial": None, "img": None, "bbox": None, "angle": 0, "source": None}
+                serial = dbg["serial"]
+                if serial:
+                    st="OK"; newname=propose(date,serial,p.suffix.lower(),existing,seen)
+                else:
+                    st="НЕ НАЙДЕНО"; newname=""
+                row={"old":p.name,"serial":serial or "","new":newname,"status":st}
+                self.q.put(("row", row, p.name, dbg))
+            except Exception as e:
+                row={"old":p.name,"serial":"","new":"","status":"ОШИБКА"}
+                self.q.put(("row", row, p.name, {"img": None, "bbox": None, "source": str(e), "angle": 0}))
+            self.q.put(("progress", None, None, None))
+        self.q.put(("done", None, None, None))
+
+    def _poll_queue(self):
+        changed=False
+        while True:
+            try:
+                kind, row, fname, dbg = self.q.get_nowait()
+            except queue.Empty:
+                break
+            if kind=="row":
+                self.rows.append(row)
+                self.tree.insert("", "end", values=(row["old"],row["serial"],row["new"],row["status"]))
+                self.preview_cache[fname]=dbg
+                changed=True
+            elif kind=="progress":
+                self.done += 1
+                self.pb["value"] = int(100*self.done/max(1,self.total))
+                self.status.set(f"Обработка {self.done}/{self.total}...")
+            elif kind=="done":
+                self.btn_preview.config(state="normal"); self.btn_cancel.config(state="disabled"); self.btn_rename.config(state="normal")
+                if self.cancel_flag:
+                    self.status.set(f"Отменено. Готово {self.done} из {self.total}.")
+                else:
+                    self.status.set("Готово. Выберите файл — справа подсветится зона.")
+                return
+        # продолжаем опрос
+        self.after(100, self._poll_queue)
+
+    # ---------- остальные действия ----------
     def apply(self):
-        if not self.rows: messagebox.showinfo("Нет данных","Сначала выполните предпросмотр."); return
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Подождите","Предпросмотр ещё выполняется или отменяется.")
+            return
+        if not self.rows:
+            messagebox.showinfo("Нет данных","Сначала выполните предпросмотр.")
+            return
         folder=Path(self.dir_var.get().strip()); ok=0
         for r in self.rows:
             if r["status"]!="OK" or not r["new"]: continue
@@ -378,14 +467,4 @@ class App(ttk.Frame):
         vals = self.tree.item(sel[0],"values"); fname = vals[0]
         for r in self.rows:
             if r["old"]==fname: r["serial"]=serial; r["status"]="OK"; break
-        date=self.date_var.get().strip(); folder=Path(self.dir_var.get().strip())
-        existing=set(os.listdir(folder)); seen={}
-        for r in self.rows:
-            r["new"] = propose(date, r["serial"], Path(r["old"]).suffix.lower(), existing, seen) if r["serial"] else ""
-        self.refresh_tree(); self.status.set("Ручной номер применён.")
-
-def main():
-    root=tk.Tk(); App(root); root.mainloop()
-
-if __name__=="__main__":
-    main()
+        date=self.date_var.get
