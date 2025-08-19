@@ -16,7 +16,7 @@ try:
 except Exception:
     pytesseract = None
 
-APP_TITLE = "Переименование отсканированных файлов — Ella Renamer v3 (зоны + якори)"
+APP_TITLE = "Переименование отсканированных файлов — Ella Renamer v3.1 (зоны+якоря, верхняя панель)"
 SUPPORTED_EXTS = (".jpg",".jpeg",".png",".webp",".tif",".tiff",".bmp",".jfif")
 PATTERN = re.compile(r"(2711\d{4}|20\d{6})")
 CONFIG_NAME = "config.json"
@@ -216,6 +216,9 @@ class App(ttk.Frame):
         self.status=tk.StringVar(value="Готово"); self.rows=[]; self.preview_cache={}
         self._photo=None
         self.build()
+        master.bind("<F5>", lambda e: self.preview())
+        master.bind("<F6>", lambda e: self.apply())
+        master.bind("<Control-o>", lambda e: self.choose_dir())
 
     def build(self):
         top=ttk.Frame(self); top.pack(fill="x", padx=10, pady=8)
@@ -230,10 +233,20 @@ class App(ttk.Frame):
         ttk.Button(top,text="Найти...",command=self.choose_tess).grid(row=2,column=2,padx=4)
         ttk.Button(top,text="Сохранить",command=self.save_cfg).grid(row=2,column=3,padx=4)
 
-        main=ttk.Frame(self); main.pack(fill="both", expand=True, padx=10, pady=6)
+        toolbar=ttk.Frame(top); toolbar.grid(row=3, column=0, columnspan=4, sticky="we", pady=(8,0))
+        ttk.Button(toolbar,text="Предпросмотр (F5)",command=self.preview).pack(side="left",padx=4)
+        ttk.Button(toolbar,text="Переименовать (F6)",command=self.apply).pack(side="left",padx=4)
+        ttk.Button(toolbar,text="Открыть папку",command=self.open_folder).pack(side="left",padx=4)
 
+        manual=ttk.Frame(top); manual.grid(row=4, column=0, columnspan=4, sticky="we", pady=(6,0))
+        ttk.Label(manual, text="Ручной ввод номера (для выбранного файла):").pack(side="left")
+        self.manual_var = tk.StringVar()
+        ttk.Entry(manual, textvariable=self.manual_var, width=20).pack(side="left", padx=6)
+        ttk.Button(manual, text="Применить к выбранному", command=self.apply_manual).pack(side="left")
+
+        main=ttk.Frame(self); main.pack(fill="both", expand=True, padx=10, pady=6)
         left=ttk.Frame(main); left.pack(side="left", fill="both", expand=True)
-        self.tree=ttk.Treeview(left,columns=("old","serial","new","status"),show="headings",height=20)
+        self.tree=ttk.Treeview(left,columns=("old","serial","new","status"),show="headings",height=18)
         for k,t,w in [("old","Старое имя",360),("serial","Номер (8 цифр)",120),("new","Новое имя",300),("status","Статус",100)]:
             self.tree.heading(k,text=t); self.tree.column(k,width=w,anchor="center" if k!="old" else "w")
         self.tree.pack(side="left",fill="both",expand=True)
@@ -242,21 +255,12 @@ class App(ttk.Frame):
         self.tree.bind("<<TreeviewSelect>>", self.on_select_row)
 
         right=ttk.Frame(main); right.pack(side="left", fill="both", expand=False, padx=(10,0))
-        self.canvas = tk.Canvas(right, width=520, height=600, bg="#f6f6f6", highlightthickness=1, highlightbackground="#cccccc")
+        self.canvas = tk.Canvas(right, width=520, height=520, bg="#f6f6f6", highlightthickness=1, highlightbackground="#cccccc")
         self.canvas.pack(fill="both", expand=False)
 
-        btns=ttk.Frame(self); btns.pack(fill="x", padx=10, pady=8)
-        ttk.Button(btns,text="Предпросмотр",command=self.preview).pack(side="left",padx=4)
-        ttk.Button(btns,text="Переименовать",command=self.apply).pack(side="left",padx=4)
-        ttk.Button(btns,text="Открыть папку",command=self.open_folder).pack(side="left",padx=4)
-
-        manual=ttk.Frame(self); manual.pack(fill="x", padx=10, pady=(0,8))
-        ttk.Label(manual, text="Ручной ввод номера (для выделенного файла):").pack(side="left")
-        self.manual_var = tk.StringVar()
-        ttk.Entry(manual, textvariable=self.manual_var, width=20).pack(side="left", padx=6)
-        ttk.Button(manual, text="Применить к выбранному", command=self.apply_manual).pack(side="left")
-
         ttk.Label(self,textvariable=self.status,anchor="w").pack(fill="x", padx=10, pady=(0,8))
+
+        top.columnconfigure(1, weight=1)
 
     def choose_dir(self):
         p=filedialog.askdirectory(title="Выберите папку с файлами")
@@ -289,7 +293,7 @@ class App(ttk.Frame):
         fs=self.files()
         if not fs: self.status.set("Файлы не найдены."); return
         date=self.date_var.get().strip()
-        if not re.fullmatch(r"\d{2}\.\d{2}\.{4}", date) and not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", date):
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", date):
             messagebox.showwarning("Дата","Введите ДД.ММ.ГГГГ или нажмите «Из имени папки»."); self.status.set("Ожидает даты."); return
         folder=Path(self.dir_var.get().strip()); existing=set(os.listdir(folder)); seen={}; self.rows=[]
 
@@ -348,7 +352,7 @@ class App(ttk.Frame):
         except Exception:
             return
         cw = self.canvas.winfo_width() or 520
-        ch = self.canvas.winfo_height() or 600
+        ch = self.canvas.winfo_height() or 520
         w,h = img.size
         scale = min(cw/w, ch/h)
         nw, nh = int(w*scale), int(h*scale)
