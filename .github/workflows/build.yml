@@ -21,12 +21,17 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build EXE
+      -       - name: Build EXE (onedir)
         run: |
-          pyinstaller --noconsole --onefile --name "EllaRenamer" --icon "icon.ico" renamer_gui.py
+          pyinstaller --onedir --noconsole --name "EllaRenamer" --icon "icon.ico" renamer_gui.py
+
+      - name: Zip artifact
+        run: |
+          powershell -Command "Compress-Archive -Path dist/EllaRenamer/* -DestinationPath EllaRenamer-Portable.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EllaRenamer
-          path: dist/EllaRenamer.exe
+          name: EllaRenamer-Portable
+          path: EllaRenamer-Portable.zip
+
